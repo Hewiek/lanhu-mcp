@@ -85,6 +85,35 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", DEFAULT_FEISHU_WEBHOOK)
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _safe_path_component(name, max_len: int = 150) -> str:
+    """将远端可控名称净化为安全的单个文件/目录名，防止路径穿越"""
+    comp = os.path.basename(str(name).replace("\\", "/"))
+    comp = re.sub(r'[^\w\s.()\-]', '_', comp).strip(" .")
+    return comp[:max_len] or "unnamed"
+
+
+def _safe_filename(name, suffix: str = "", max_len: int = 150) -> str:
+    """生成白名单文件名字符：仅字母数字与 . _ -，天然排除 ..、路径分隔符与所有元字符"""
+    s = re.sub(r'[^A-Za-z0-9._-]', '_', str(name))[:max_len]
+    s = s.strip(" .")
+    if not s:
+        s = "unnamed"
+    return f"{s}{suffix}"
+
+
+def _contained_path(base: Path, *parts) -> Path:
+    """拼接路径并确保结果仍在 base 目录内；各段不得含路径分隔符或 ..，否则拒绝"""
+    for p in parts:
+        s = str(p)
+        if "/" in s or "\\" in s or ".." in Path(s).parts:
+            raise ValueError("Path traversal blocked")
+    base_resolved = Path(base).resolve()
+    target = base_resolved.joinpath(*parts).resolve()
+    if target != base_resolved and not target.is_relative_to(base_resolved):
+        raise ValueError("Path traversal blocked")
+    return target
+
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 
@@ -2020,7 +2049,7 @@ class MessageStore:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         if project_id:
-            self.file_path = self.storage_dir / f"{project_id}.json"
+            self.file_path = self.storage_dir / f"{_safe_path_component(project_id)}.json"
             self._data = self._load()
         else:
             # 全局模式，不加载单个文件
@@ -2044,8 +2073,8 @@ class MessageStore:
     
     def _save(self):
         """保存项目数据"""
-        with open(self.file_path, 'w', encoding='utf-8') as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        _safe_path = _contained_path(self.storage_dir, self.file_path.name)
+        _safe_path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding='utf-8')
     
     def _get_now(self) -> str:
         """获取当前时间字符串（东八区/北京时间）"""
@@ -2783,8 +2812,8 @@ class LanhuExtractor:
         }
 
     def _get_cache_meta_path(self, output_dir: Path) -> Path:
-        """获取缓存元数据文件路径"""
-        return output_dir / self.CACHE_META_FILE
+        """获取缓存元数据文件路径（限制在 output_dir 内）"""
+        return _contained_path(Path(output_dir), self.CACHE_META_FILE)
 
     def _load_cache_meta(self, output_dir: Path) -> dict:
         """加载缓存元数据"""
@@ -2800,9 +2829,8 @@ class LanhuExtractor:
     def _save_cache_meta(self, output_dir: Path, meta_data: dict):
         """保存缓存元数据"""
         meta_path = self._get_cache_meta_path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump(meta_data, f, ensure_ascii=False, indent=2)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta_data, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def _check_file_integrity(self, output_dir: Path, expected_files: dict) -> dict:
         """
@@ -3084,7 +3112,7 @@ class LanhuExtractor:
         project_mapping = response.json()
 
         # 创建输出目录
-        output_path = Path(output_dir)
+        output_path = _contained_path(DATA_DIR, _safe_path_component(output_dir))
 
         # 检查是否需要更新
         if not force_update and output_path.exists():
@@ -3115,6 +3143,8 @@ class LanhuExtractor:
         downloaded_files = []
 
         for html_filename, page_info in pages.items():
+            # 远端 mapping 的键可含路径分隔符，先净化为安全单层文件名
+            html_filename = _safe_path_component(html_filename)
             html_data = page_info.get('html', {})
             html_file_with_md5 = html_data.get('sign_md5', '')
             page_mapping_md5 = page_info.get('mapping_md5', '')
@@ -3991,8 +4021,7 @@ function lanhu_Axure_Mapping_Data(data) {
             else:
                 head.append(mapping_script)
 
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(str(soup))
+        html_path.write_text(str(soup), encoding='utf-8')
 
 
 async def screenshot_page_internal(resource_dir: str, page_names: List[str], output_dir: str,
@@ -4003,7 +4032,7 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
     import threading
     import time
 
-    output_path = Path(output_dir)
+    output_path = _contained_path(DATA_DIR, _safe_path_component(output_dir))
     output_path.mkdir(parents=True, exist_ok=True)
     
     # 缓存元数据文件
@@ -4357,15 +4386,13 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
 
                 # 保存样式信息到文件（用于缓存）
                 try:
-                    with open(styles_path, 'w', encoding='utf-8') as sf:
-                        json.dump(page_design_info, sf, ensure_ascii=False)
+                    styles_path.write_text(json.dumps(page_design_info, ensure_ascii=False), encoding='utf-8')
                 except Exception:
                     pass
 
                 # 保存 Axure 标注信息到文件（用于缓存）
                 try:
-                    with open(annotations_path, 'w', encoding='utf-8') as af:
-                        json.dump(axure_annotations, af, ensure_ascii=False)
+                    annotations_path.write_text(json.dumps(axure_annotations, ensure_ascii=False), encoding='utf-8')
                 except Exception:
                     pass
 
@@ -4404,8 +4431,7 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
         cache_meta['version_id'] = version_id
         cache_meta['cached_pages'] = page_names
         try:
-            with open(cache_meta_path, 'w', encoding='utf-8') as f:
-                json.dump(cache_meta, f, ensure_ascii=False, indent=2)
+            cache_meta_path.write_text(json.dumps(cache_meta, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception:
             pass
 
@@ -5896,7 +5922,7 @@ async def lanhu_get_ai_analyze_design_result(
                 f"⚠️ No matching design found\n\nAvailable designs:\n" + "\n".join(f"  • {name}" for name in available_names)]
 
         # 设置输出目录（内部实现，自动管理）
-        output_dir = DATA_DIR / 'lanhu_designs' / params['project_id']
+        output_dir = DATA_DIR / 'lanhu_designs' / _safe_path_component(params['project_id'])
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 下载设计图并生成HTML
@@ -5916,12 +5942,11 @@ async def lanhu_get_ai_analyze_design_result(
                 response = await extractor.client.get(img_url)
                 response.raise_for_status()
 
-                # 保存文件（文件名中的 / 替换为 _，避免路径分隔符问题）
-                img_filename = f"{design['name'].replace('/', '_')}.png"
+                # 保存文件（净化设计图名称，避免路径分隔符与穿越问题）
+                img_filename = f"{_safe_path_component(design['name'])}.png"
                 img_filepath = output_dir / img_filename
 
-                with open(img_filepath, 'wb') as f:
-                    f.write(response.content)
+                img_filepath.write_bytes(response.content)
 
                 image_results.append({
                     'success': True,
@@ -5953,12 +5978,11 @@ async def lanhu_get_ai_analyze_design_result(
                 # 远程图片 URL 替换为本地路径，生成下载映射表
                 html_code, image_url_mapping = _localize_image_urls(html_code, design['name'])
                 
-                # 保存HTML文件（文件名中的 / 替换为 _）
-                html_filename = f"{design['name'].replace('/', '_')}.html"
+                # 保存HTML文件（净化设计图名称，避免路径分隔符与穿越问题）
+                html_filename = f"{_safe_path_component(design['name'])}.html"
                 html_filepath = output_dir / html_filename
                 
-                with open(html_filepath, 'w', encoding='utf-8') as f:
-                    f.write(html_code)
+                html_filepath.write_text(html_code, encoding='utf-8')
                 
                 html_results.append({
                     'success': True,
